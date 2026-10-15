@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.deskalert.trigger'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.deskalert.trigger"
+        minSdk 24
+        targetSdk 34
+        versionCode 6
+        versionName "2.3"
+    }
+
+    // Universal APK: no ABI/density splits (the app has no native code)
+    splits {
+        abi { enable false }
+        density { enable false }
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}

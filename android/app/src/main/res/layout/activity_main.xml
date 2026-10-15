@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true">
+<LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:gravity="center" android:orientation="vertical" android:padding="24dp">
+
+    <TextView android:id="@+id/statusText" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:textSize="15sp" android:paddingBottom="12dp" />
+
+    <Button android:id="@+id/accessButton" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Open notification access settings" />
+
+    <EditText android:id="@+id/passwordInput" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="16dp" android:hint="App password" android:inputType="textPassword" />
+
+    <Button android:id="@+id/sendButton" android:layout_width="match_parent" android:layout_height="80dp"
+        android:layout_marginTop="16dp" android:text="Send Test Alert" android:textSize="18sp" />
+
+    <Button android:id="@+id/callButton" android:layout_width="match_parent" android:layout_height="56dp"
+        android:layout_marginTop="8dp" android:text="Send Test Call Alert" />
+</LinearLayout>
+</ScrollView>
