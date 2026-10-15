@@ -13,6 +13,7 @@ Validates `APP_PASSWORD` and stores phone notifications in Supabase.
 | POST | `/api/noti` | same as `/api/notify` | Alias of `/api/notify` |
 | POST/GET | `/api/reply` | `x-app-password` | Dashboard queues / checks a WhatsApp reply |
 | GET/POST | `/api/replies` | `x-app-password` | Phone app fetches pending replies / reports result |
+| DELETE | `/api/notification?id=` | `x-app-password` | Delete one notification |
 | DELETE | `/api/clear` | `x-app-password` header | Clear all history |
 
 ### MacroDroid payload
