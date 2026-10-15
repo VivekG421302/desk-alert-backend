@@ -1,9 +1,14 @@
+import crypto from 'node:crypto';
 import { json, preflight, passwordOk, db, misconfigured } from '../../../lib/http';
 
 export const dynamic = 'force-dynamic';
 const M = 'POST';
-const LIMITS = { appName: 100, title: 300, message: 4000 };
+const LIMITS = { appName: 100, title: 300, message: 4000, replyKey: 100 };
 const TYPES = new Set(['CALL', 'MESSAGE']);
+const DEDUPE_WINDOW_MS = 20_000;
+
+// MacroDroid often sends calls as plain notifications: detect them by text
+const looksLikeCall = (s) => /incoming.*call|is calling|calling\.\.\./i.test(s) && !/missed|ongoing|ended|declined/i.test(s);
 
 export const OPTIONS = () => preflight(M);
 
@@ -13,21 +18,34 @@ export async function POST(req) {
   let body;
   try { body = await req.json(); } catch { return json({ error: 'Invalid JSON' }, 400, M); }
   if (!body || typeof body !== 'object') return json({ error: 'Invalid body' }, 400, M);
-
   if (!passwordOk(body.secret)) return json({ error: 'Unauthorized' }, 401, M);
 
   const clean = (v, max, fallback) =>
     (typeof v === 'string' && v.trim() ? v.trim() : fallback).slice(0, max);
 
-  const type = String(body.type || 'MESSAGE').trim().toUpperCase();
   const row = {
     app_name: clean(body.appName, LIMITS.appName, 'Unknown'),
     title: clean(body.title, LIMITS.title, 'Unknown'),
     message: clean(body.message, LIMITS.message, '(no content)'),
-    type: TYPES.has(type) ? type : 'MESSAGE',
+    type: TYPES.has(String(body.type || '').toUpperCase()) ? String(body.type).toUpperCase() : 'MESSAGE',
   };
+  if (row.type !== 'CALL' && looksLikeCall(`${row.title} ${row.message}`)) row.type = 'CALL';
 
-  const { data, error } = await db().from('notifications').insert(row).select().single();
+  const replyKey = clean(body.replyKey, LIMITS.replyKey, '');
+  const bucket = Math.floor(Date.now() / DEDUPE_WINDOW_MS);
+  const dedupe_key = crypto.createHash('sha256')
+    .update([row.app_name, row.title, row.message, row.type, bucket].join('|')).digest('hex');
+
+  const extra = { dedupe_key, ...(replyKey && row.type !== 'CALL' ? { reply_key: replyKey, can_reply: true } : {}) };
+  let { data, error } = await db().from('notifications').insert({ ...row, ...extra }).select('id').single();
+
+  if (error?.code === '23505') {                       // same alert already stored in this window
+    if (extra.reply_key) await db().from('notifications').update({ reply_key: replyKey, can_reply: true }).eq('dedupe_key', dedupe_key);
+    return json({ ok: true, duplicate: true }, 200, M);
+  }
+  if (error && (error.code === '42703' || error.code === 'PGRST204')) {   // migration 003 not run yet
+    ({ data, error } = await db().from('notifications').insert(row).select('id').single());
+  }
   if (error) {
     console.error('Supabase insert failed:', error.message);
     return json({ error: 'Failed to store notification' }, 502, M);
