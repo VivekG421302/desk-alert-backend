@@ -20,8 +20,8 @@ final class Api {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + path).openConnection();
         try {
             c.setRequestMethod(method);
-            c.setConnectTimeout(10000);
-            c.setReadTimeout(10000);
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(8000);
             c.setRequestProperty("x-app-password", password);
             if (jsonBody != null) {
                 c.setDoOutput(true);
@@ -35,6 +35,9 @@ final class Api {
             ByteArrayOutputStream bo = new ByteArrayOutputStream();
             if (is != null) { byte[] buf = new byte[2048]; int n; while ((n = is.read(buf)) > 0) bo.write(buf, 0, n); is.close(); }
             return new Result(code, bo.toString("UTF-8"));
-        } finally { c.disconnect(); }
+        } catch (Exception ex) {
+            c.disconnect();                       // only drop the connection on errors; on success it is reused (no new TLS handshake)
+            throw ex;
+        }
     }
 }

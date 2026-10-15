@@ -6,6 +6,10 @@ import android.app.RemoteInput;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -53,19 +57,44 @@ public class NotifService extends NotificationListenerService {
     private final Set<String> callKeys = new HashSet<String>();                                   // ringing calls queued/sent (handler thread only)
     private final Map<String, String> callIds = new ConcurrentHashMap<String, String>();          // sbn key -> dashboard id of a ringing call
     private final Set<String> cancelledCalls = new HashSet<String>();                             // ring ended before the card was sent
-    private HandlerThread thread;
-    private Handler handler;
-    private boolean polling;
-    private long backoff = 5000;
+    private static final long WARM_MS = 4 * 60 * 1000L;
+    private HandlerThread thread, pollThread;
+    private Handler handler;          // sender thread: outbox flush, call removal, keep-warm (never blocked by reply polling)
+    private Handler pollHandler;      // reply polling thread
+    private boolean polling;          // pollHandler thread only
+    private long backoff = 1000;      // quick retries: 1s, 2s, 4s, then every 5s
+    private ConnectivityManager.NetworkCallback netCb;
 
     @Override public void onCreate() {
         super.onCreate();
-        thread = new HandlerThread("deskalert-net");
+        thread = new HandlerThread("deskalert-send");
         thread.start();
         handler = new Handler(thread.getLooper());
+        pollThread = new HandlerThread("deskalert-reply");
+        pollThread.start();
+        pollHandler = new Handler(pollThread.getLooper());
+        handler.postDelayed(warmTask, 2000);
+        try {   // the moment the network is back, flush immediately
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            netCb = new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(Network network) { backoff = 1000; kickFlush(); }
+            };
+            cm.registerNetworkCallback(new NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), netCb);
+        } catch (Exception ignored) {}
     }
 
-    @Override public void onDestroy() { super.onDestroy(); thread.quit(); }
+    @Override public void onDestroy() {
+        super.onDestroy();
+        try { if (netCb != null) ((ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE)).unregisterNetworkCallback(netCb); } catch (Exception ignored) {}
+        thread.quit();
+        pollThread.quit();
+    }
+
+    /** Keeps the HTTPS connection and the serverless function warm so the next notification is sent in ~1 s. */
+    private final Runnable warmTask = new Runnable() { public void run() {
+        try { String pw = Prefs.password(NotifService.this); if (!pw.isEmpty()) Api.request("GET", "/api/health", pw, null); } catch (Exception ignored) {}
+        handler.postDelayed(this, WARM_MS);
+    }};
 
     @Override public void onListenerConnected() {
         super.onListenerConnected();
@@ -113,7 +142,8 @@ public class NotifService extends NotificationListenerService {
         return new JSONObject().put("appName", appName)
                 .put("title", title.isEmpty() ? appName : title)
                 .put("message", message.isEmpty() ? (type.equals("CALL") ? "Incoming call" : "(no content)") : message)
-                .put("type", type).put("postedAt", postedAt).put("clientId", sha(idSeed));
+                .put("type", type).put("postedAt", postedAt).put("clientId", sha(idSeed))
+                .put("_q", System.currentTimeMillis());
     }
 
     @Override public void onNotificationPosted(StatusBarNotification sbn) {
@@ -295,8 +325,8 @@ public class NotifService extends NotificationListenerService {
     private final Runnable flushTask = new Runnable() { public void run() {
         boolean retry;
         try { retry = flushOnce(); } catch (Throwable t) { retry = true; }
-        if (retry) { handler.postDelayed(this, backoff); backoff = Math.min(backoff * 2, 300000L); }
-        else backoff = 5000;
+        if (retry) { handler.postDelayed(this, backoff); backoff = Math.min(backoff * 2, 5000L); }
+        else backoff = 1000;
     }};
 
     /** @return true if sending should be retried later (network down / server error) */
@@ -319,6 +349,7 @@ public class NotifService extends NotificationListenerService {
             JSONObject body = new JSONObject(it.toString()).put("secret", password);
             Api.Result r;
             String sum = it.optString("title") + ": " + it.optString("message");
+            long t0 = System.currentTimeMillis();
             try { r = Api.request("POST", "/api/noti", password, body.toString()); }
             catch (Exception ex) {
                 Journal.add(this, it.optString("appName"), sum, "OFFLINE: " + ex.getClass().getSimpleName() + " - retrying in " + (backoff / 1000) + "s");
@@ -326,7 +357,9 @@ public class NotifService extends NotificationListenerService {
             }
             if (r.ok()) {
                 Outbox.dropFirst(this);
-                Journal.add(this, it.optString("appName"), sum, "SENT (HTTP " + r.code + (r.body.contains("\"duplicate\"") ? ", duplicate ignored" : "") + ")");
+                long now = System.currentTimeMillis();
+                Journal.add(this, it.optString("appName"), sum, "SENT in " + (now - it.optLong("_q", now)) + " ms (network " + (now - t0) + " ms, HTTP " + r.code
+                        + (r.body.contains("\"duplicate\"") ? ", duplicate ignored" : "") + ")");
                 if ("CALL".equals(type)) {
                     String id = new JSONObject(r.body).optString("id", "");
                     if (!id.isEmpty()) callIds.put(key, id);
@@ -345,12 +378,14 @@ public class NotifService extends NotificationListenerService {
 
     // ---------- reply polling: runs only while at least one reply-able notification is held ----------
     private void ensurePolling() {
-        if (!polling) { polling = true; handler.postDelayed(pollTask, POLL_MS); }
+        pollHandler.post(new Runnable() { public void run() {
+            if (!polling) { polling = true; pollHandler.postDelayed(pollTask, POLL_MS); }
+        }});
     }
 
     private final Runnable pollTask = new Runnable() { public void run() {
         try { pollReplies(); } catch (Exception ignored) {}
-        if (!held.isEmpty()) handler.postDelayed(this, POLL_MS); else polling = false;
+        if (!held.isEmpty()) pollHandler.postDelayed(this, POLL_MS); else polling = false;
     }};
 
     private void pollReplies() throws Exception {
