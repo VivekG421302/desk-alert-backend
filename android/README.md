@@ -4,6 +4,7 @@ Runs on your phone and feeds the Desk Alert dashboard:
 
 - **Forwards every notification** (any app: WhatsApp, Naukri, SMS, banks…) and incoming calls (WhatsApp and normal phone calls) to the backend (`/api/noti`). Ongoing, progress/media and group-summary notifications are skipped.
   Incoming calls are sent as `CALL` (flashing red on the dashboard) and the card is removed automatically when the ringing ends (a missed-call notification then appears as a normal alert).
+- **Exactly once:** chat messages are sent one by one (4 messages = 4 cards, the 5th adds one more), inbox-style lines likewise. Items go through a persistent queue with retry, so nothing is lost offline and nothing is sent twice (each has a stable `clientId`).
 - **Replies from the dashboard:** when a message has Android's inline reply action, the dashboard shows a reply box. The app polls `/api/replies` only while a replyable notification is held, and sends the reply through that notification.
 - **Test buttons** for a message and a call alert.
 - A status box shows listener state, the last notification seen from any app, and what happened to the last WhatsApp one (for troubleshooting).

@@ -8,37 +8,54 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Parcelable;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Forwards every useful notification (any app) to the backend.
- * Incoming calls (WhatsApp and normal phone calls) are sent as CALL and removed again when the ringing ends.
- * Dashboard replies are sent through a notification's inline-reply action.
+ * Forwards every notification (any app) to the backend exactly once.
+ *  - chat notifications (MessagingStyle): each new message is sent individually
+ *  - inbox-style notifications: each new line is sent individually
+ *  - everything else: sent when its content changes
+ *  - incoming calls (WhatsApp + normal phone calls): sent as CALL, removed again when the ringing ends
+ * Items go through a persistent queue with retry, so nothing is lost while offline.
  */
 public class NotifService extends NotificationListenerService {
     private static final String WA = "com.whatsapp";
     private static final String WA_BIZ = "com.whatsapp.w4b";
     private static final long HOLD_MS = 30 * 60 * 1000L;
     private static final long POLL_MS = 4000L;
+    private static final long ONGOING_THROTTLE_MS = 30000L;
+    private static final int MAX_MESSAGES_PER_POST = 10;
 
     private static final class Held {
         final Notification.Action action; final String sbnKey; final long time;
         Held(Notification.Action a, String k) { action = a; sbnKey = k; time = System.currentTimeMillis(); }
     }
 
-    private final Map<String, Held> held = new ConcurrentHashMap<String, Held>();        // reply token -> inline reply action
-    private final Map<String, String> lastSig = new ConcurrentHashMap<String, String>();   // sbn key -> last title|text
-    private final Map<String, String> callIds = new ConcurrentHashMap<String, String>();   // sbn key -> dashboard id of a ringing call
+    private final Map<String, Held> held = new ConcurrentHashMap<String, Held>();              // reply token -> inline reply action
+    private final Map<String, String> lastSig = new ConcurrentHashMap<String, String>();         // sbn key -> last title|text (plain notifications)
+    private final Map<String, Long> lastMsgTime = new ConcurrentHashMap<String, Long>();          // sbn key -> newest chat message already sent
+    private final Map<String, Set<String>> seenLines = new ConcurrentHashMap<String, Set<String>>(); // sbn key -> inbox lines already sent
+    private final Map<String, Long> lastSent = new ConcurrentHashMap<String, Long>();             // sbn key -> time of last send (throttle ongoing)
+    private final Set<String> callKeys = new HashSet<String>();                                   // ringing calls queued/sent (handler thread only)
+    private final Map<String, String> callIds = new ConcurrentHashMap<String, String>();          // sbn key -> dashboard id of a ringing call
+    private final Set<String> cancelledCalls = new HashSet<String>();                             // ring ended before the card was sent
     private HandlerThread thread;
     private Handler handler;
     private boolean polling;
+    private long backoff = 5000;
 
     @Override public void onCreate() {
         super.onCreate();
@@ -49,13 +66,26 @@ public class NotifService extends NotificationListenerService {
 
     @Override public void onDestroy() { super.onDestroy(); thread.quit(); }
 
-    @Override public void onListenerConnected() { super.onListenerConnected(); Prefs.put(this, "connected", Prefs.now()); }
+    @Override public void onListenerConnected() {
+        super.onListenerConnected();
+        Prefs.put(this, "connected", Prefs.now());
+        kickFlush();                                           // send anything left in the queue
+    }
 
     private static String str(CharSequence cs) { return cs == null ? "" : cs.toString().trim(); }
 
     private static String firstNonEmpty(Bundle e, String... keys) {
         for (String k : keys) { String v = str(e.getCharSequence(k)); if (!v.isEmpty()) return v; }
         return "";
+    }
+
+    private static String sha(String s) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest(s.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 16; i++) sb.append(String.format("%02x", d[i]));
+            return sb.toString();
+        } catch (Exception ex) { return Integer.toHexString(s.hashCode()); }
     }
 
     private String labelFor(String pkg) {
@@ -70,6 +100,13 @@ public class NotifService extends NotificationListenerService {
         }
     }
 
+    private JSONObject item(String appName, String title, String message, String type, long postedAt, String idSeed) throws Exception {
+        return new JSONObject().put("appName", appName)
+                .put("title", title.isEmpty() ? appName : title)
+                .put("message", message.isEmpty() ? (type.equals("CALL") ? "Incoming call" : "(no content)") : message)
+                .put("type", type).put("postedAt", postedAt).put("clientId", sha(idSeed));
+    }
+
     @Override public void onNotificationPosted(StatusBarNotification sbn) {
         try {
             Prefs.put(this, "any", sbn.getPackageName() + " at " + Prefs.now());
@@ -79,7 +116,7 @@ public class NotifService extends NotificationListenerService {
         }
     }
 
-    private void handle(StatusBarNotification sbn) {
+    private void handle(StatusBarNotification sbn) throws Exception {
         final String pkg = sbn.getPackageName();
         if (getPackageName().equals(pkg)) return;                                  // never forward our own notifications
         final String password = Prefs.password(this);
@@ -88,98 +125,191 @@ public class NotifService extends NotificationListenerService {
         Notification n = sbn.getNotification();
         Bundle e = n.extras;
         final String title = firstNonEmpty(e, Notification.EXTRA_TITLE, Notification.EXTRA_TITLE_BIG);
-        final String text = firstNonEmpty(e, Notification.EXTRA_TEXT, Notification.EXTRA_BIG_TEXT, Notification.EXTRA_SUB_TEXT);
+        String text = firstNonEmpty(e, Notification.EXTRA_TEXT, Notification.EXTRA_BIG_TEXT, Notification.EXTRA_SUB_TEXT);
+        String big = str(e.getCharSequence(Notification.EXTRA_BIG_TEXT));
+        if (big.length() > text.length()) text = big;                                // full text instead of the truncated line
+        final String fullText = text;
         String all = (title + " " + text).toLowerCase();
         int actionCount = n.actions == null ? 0 : n.actions.length;
         boolean fullScreen = n.fullScreenIntent != null;
         boolean wa = WA.equals(pkg) || WA_BIZ.equals(pkg);
-        boolean missedOrOngoing = all.contains("missed") || all.contains("ongoing") || all.contains("ended") || all.contains("declined");
+        boolean missed = all.contains("missed");
+        boolean missedOrOngoing = missed || all.contains("ongoing") || all.contains("ended") || all.contains("declined");
         boolean incomingText = all.contains("incoming") && all.contains("call");
         boolean callCategory = Notification.CATEGORY_CALL.equals(n.category);
         boolean dialerLike = pkg.contains("incallui") || pkg.contains("dialer") || pkg.contains("telecom") || pkg.equals("com.android.phone");
 
         final boolean call;
         if (wa) {
-            // unchanged rule that already works for WhatsApp
-            call = !missedOrOngoing && (fullScreen || incomingText || (callCategory && actionCount >= 2));
+            call = !missedOrOngoing && (fullScreen || incomingText || (callCategory && actionCount >= 2));   // rule that already works
         } else {
-            // normal phone calls and other calling apps: must look like a call AND be ringing
             call = !missedOrOngoing && (callCategory || dialerLike) && (fullScreen || incomingText);
         }
         final String key = sbn.getKey();
+        final String appName = labelFor(pkg);
         String info = "pkg=" + pkg + " | title=" + title + " | text=" + text + " | cat=" + n.category + " | flags=" + n.flags
                 + " | fullScreen=" + fullScreen + " | actions=" + actionCount;
 
-        // A ringing call that has turned into something else (answered / ongoing) -> remove its dashboard card
-        if (!call && callIds.containsKey(key)) removeCallCard(key, password);
+        // a ringing call that turned into something else (answered / ongoing) -> remove its dashboard card
+        if (!call) { final String k = key; handler.post(new Runnable() { public void run() { if (callKeys.contains(k)) endCall(k, password); } }); }
 
-        if (!call) {
-            String skip = null;
-            int f = n.flags;
-            if ((f & Notification.FLAG_GROUP_SUMMARY) != 0) skip = "group summary";                         // duplicates its children
-            else if ((f & (Notification.FLAG_ONGOING_EVENT | Notification.FLAG_FOREGROUND_SERVICE)) != 0) skip = "ongoing";
-            else if (Notification.CATEGORY_PROGRESS.equals(n.category) || Notification.CATEGORY_TRANSPORT.equals(n.category)
-                    || Notification.CATEGORY_SERVICE.equals(n.category)) skip = "progress/media/service";
-            else if (title.isEmpty() && text.isEmpty()) skip = "empty";
-            else if (wa && (text.isEmpty() || title.equalsIgnoreCase("WhatsApp") || title.equalsIgnoreCase("WhatsApp Business"))) skip = "generic WhatsApp";
-            else if (wa && text.toLowerCase().matches("^\\d+ new messages?.*")) skip = "count summary";
-            if (skip != null) { Prefs.setLastSeen(this, "SKIPPED (" + skip + ")\n" + info); return; }
+        // ---------- incoming call ----------
+        if (call) {
+            String sig = title + "|" + text;
+            if (sig.equals(lastSig.get(key))) return;
+            lastSig.put(key, sig);
+            final JSONObject it = item(appName, title.isEmpty() ? (wa ? "WhatsApp call" : "Incoming call") : title, text, "CALL",
+                    System.currentTimeMillis(), pkg + "|" + key + "|call|" + sbn.getPostTime());
+            it.put("_key", key);
+            Prefs.setLastSeen(this, "SENT as CALL\n" + info);
+            handler.post(new Runnable() { public void run() { callKeys.add(key); } });
+            Outbox.add(this, it);
+            kickFlush();
+            return;
         }
 
-        String sig = title + "|" + text;
-        if (sig.equals(lastSig.get(key))) return;                                                          // re-post of the same notification
-        lastSig.put(key, sig);
-        Prefs.setLastSeen(this, (call ? "SENT as CALL" : "SENT as MESSAGE") + "\n" + info);
+        // ---------- everything else ----------
+        int f = n.flags;
+        boolean ongoing = (f & (Notification.FLAG_ONGOING_EVENT | Notification.FLAG_FOREGROUND_SERVICE)) != 0;
+        String skip = null;
+        if ((f & Notification.FLAG_GROUP_SUMMARY) != 0) skip = "group summary";                              // its children are sent themselves
+        else if (Notification.CATEGORY_PROGRESS.equals(n.category) || e.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0
+                || e.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)) skip = "progress bar";
+        else if (callCategory && !missed) skip = "call in progress";
+        else if (wa && (title.equalsIgnoreCase("WhatsApp") || title.equalsIgnoreCase("WhatsApp Business"))) skip = "generic WhatsApp";
+        else if (wa && all.matches("^.*\\b\\d+ new messages?.*$")) skip = "count summary";
+        if (skip != null) { Prefs.setLastSeen(this, "SKIPPED (" + skip + ")\n" + info); return; }
 
-        String token = "";
-        if (!call && n.actions != null) {
-            for (Notification.Action a : n.actions) {
-                RemoteInput[] ris = a.getRemoteInputs();
-                if (ris != null && ris.length > 0) { token = UUID.randomUUID().toString(); held.put(token, new Held(a, key)); break; }
+        List<JSONObject> items = new ArrayList<JSONObject>();
+        Parcelable[] msgs = e.getParcelableArray("android.messages");
+        boolean timed = msgs != null && msgs.length > 0;
+        if (timed) {
+            for (Parcelable p : msgs) { if (!(p instanceof Bundle) || ((Bundle) p).getLong("time") == 0) { timed = false; break; } }
+        }
+        if (timed) {
+            // chat: send each message we have not sent yet
+            String conv = str(e.getCharSequence("android.conversationTitle"));
+            String chatTitle = !conv.isEmpty() ? conv : title.replaceAll("\\s*\\(\\d+ messages?\\)$", "");
+            Long seen = lastMsgTime.get(key);
+            long last = seen == null ? 0 : seen, maxT = last;
+            for (int i = Math.max(0, msgs.length - MAX_MESSAGES_PER_POST); i < msgs.length; i++) {
+                Bundle m = (Bundle) msgs[i];
+                long t = m.getLong("time");
+                String mt = str(m.getCharSequence("text"));
+                if (mt.isEmpty() || t <= last) continue;
+                String sender = str(m.getCharSequence("sender"));
+                String body = (!conv.isEmpty() && !sender.isEmpty()) ? sender + ": " + mt : mt;
+                items.add(item(appName, chatTitle, body, "MESSAGE", t, pkg + "|" + t + "|" + sender + "|" + mt));
+                if (t > maxT) maxT = t;
+            }
+            if (maxT > last) lastMsgTime.put(key, maxT);
+        } else {
+            CharSequence[] lines = e.getCharSequenceArray("android.textLines");
+            if (lines != null && lines.length > 0) {
+                Set<String> seen = seenLines.get(key);
+                if (seen == null) { seen = new HashSet<String>(); seenLines.put(key, seen); }
+                for (CharSequence cs : lines) {
+                    String line = str(cs);
+                    if (!line.isEmpty() && seen.add(line))
+                        items.add(item(appName, title, line, "MESSAGE", System.currentTimeMillis(), pkg + "|" + key + "|" + line));
+                }
+                if (seen.size() > 60) seen.clear();
+            } else if (!(title.isEmpty() && fullText.isEmpty())) {
+                String sig = title + "|" + fullText;
+                Long ls = lastSent.get(key);
+                boolean throttled = ongoing && ls != null && System.currentTimeMillis() - ls < ONGOING_THROTTLE_MS;
+                if (!sig.equals(lastSig.get(key)) && !throttled) {
+                    lastSig.put(key, sig);
+                    items.add(item(appName, title, fullText, "MESSAGE", sbn.getPostTime(), pkg + "|" + key + "|" + sig + "|" + sbn.getPostTime()));
+                }
             }
         }
-        final String replyKey = token;
-        final boolean isCall = call;
-        final String appName = labelFor(pkg);
+        if (items.isEmpty()) return;
+        lastSent.put(key, System.currentTimeMillis());
+        if (lastMsgTime.size() > 500) lastMsgTime.clear();
+        if (lastSent.size() > 500) lastSent.clear();
 
-        handler.post(new Runnable() { public void run() {
-            try {
-                JSONObject body = new JSONObject().put("secret", password).put("appName", appName)
-                        .put("title", title.isEmpty() ? (isCall ? "Incoming call" : appName) : title)
-                        .put("message", text.isEmpty() ? (isCall ? "Incoming call" : "(no content)") : text)
-                        .put("type", isCall ? "CALL" : "MESSAGE");
-                if (!replyKey.isEmpty()) body.put("replyKey", replyKey);
-                Api.Result r = Api.request("POST", "/api/noti", password, body.toString());
-                if (!r.ok()) { held.remove(replyKey); return; }
-                if (!replyKey.isEmpty()) ensurePolling();
-                if (isCall) {
-                    String id = new JSONObject(r.body).optString("id", "");
-                    if (!id.isEmpty()) callIds.put(key, id);
+        // inline reply: attach a token to the newest item
+        if (n.actions != null) {
+            for (Notification.Action a : n.actions) {
+                RemoteInput[] ris = a.getRemoteInputs();
+                if (ris != null && ris.length > 0) {
+                    String token = UUID.randomUUID().toString();
+                    held.put(token, new Held(a, key));
+                    items.get(items.size() - 1).put("replyKey", token);
+                    break;
                 }
-            } catch (Exception ex) { held.remove(replyKey); }
-        }});
+            }
+        }
+        Prefs.setLastSeen(this, "SENT " + items.size() + " as MESSAGE\n" + info);
+        for (JSONObject it : items) Outbox.add(this, it);
+        kickFlush();
     }
 
     @Override public void onNotificationRemoved(StatusBarNotification sbn) {
-        String key = sbn.getKey();
+        final String key = sbn.getKey();
         lastSig.remove(key);
+        seenLines.remove(key);                                  // lastMsgTime is kept on purpose: never resend old chat messages
         for (Iterator<Map.Entry<String, Held>> it = held.entrySet().iterator(); it.hasNext();) {
             if (it.next().getValue().sbnKey.equals(key)) it.remove();
         }
-        // Ringing ended (missed / declined / answered): take the call card off the dashboard
-        if (callIds.containsKey(key)) removeCallCard(key, Prefs.password(this));
+        // ringing ended (missed / declined / answered): take the call card off the dashboard
+        final String password = Prefs.password(this);
+        handler.post(new Runnable() { public void run() { if (callKeys.contains(key)) endCall(key, password); } });
     }
 
-    /** Runs on the network thread, after any pending POST for the same call, so the id is known by then. */
-    private void removeCallCard(final String key, final String password) {
-        handler.post(new Runnable() { public void run() {
-            String id = callIds.remove(key);
-            if (id == null || password.isEmpty()) return;
-            try { Api.request("DELETE", "/api/notification?id=" + id, password, null); } catch (Exception ignored) {}
-        }});
+    /** Handler thread. */
+    private void endCall(String key, String password) {
+        callKeys.remove(key);
+        String id = callIds.remove(key);
+        if (id == null) { cancelledCalls.add(key); return; }                   // not sent yet: flush will drop it
+        if (password.isEmpty()) return;
+        try { Api.request("DELETE", "/api/notification?id=" + id, password, null); } catch (Exception ignored) {}
     }
 
-    // ---- reply polling: runs only while at least one reply-able notification is held ----
+    // ---------- outbox flushing (handler thread) ----------
+    private void kickFlush() { handler.removeCallbacks(flushTask); handler.post(flushTask); }
+
+    private final Runnable flushTask = new Runnable() { public void run() {
+        boolean retry;
+        try { retry = flushOnce(); } catch (Throwable t) { retry = true; }
+        if (retry) { handler.postDelayed(this, backoff); backoff = Math.min(backoff * 2, 300000L); }
+        else backoff = 5000;
+    }};
+
+    /** @return true if sending should be retried later (network down / server error) */
+    private boolean flushOnce() throws Exception {
+        String password = Prefs.password(this);
+        if (password.isEmpty()) return false;
+        while (true) {
+            JSONObject it = Outbox.first(this);
+            if (it == null) return false;
+            String type = it.optString("type");
+            String key = it.optString("_key", "");
+            if ("CALL".equals(type)) {
+                long age = System.currentTimeMillis() - it.optLong("postedAt", System.currentTimeMillis());
+                if (age > 90000L || cancelledCalls.remove(key)) { Outbox.dropFirst(this); callKeys.remove(key); continue; }   // stale ring
+            }
+            JSONObject body = new JSONObject(it.toString()).put("secret", password);
+            Api.Result r;
+            try { r = Api.request("POST", "/api/noti", password, body.toString()); } catch (Exception ex) { return true; }
+            if (r.ok()) {
+                Outbox.dropFirst(this);
+                if ("CALL".equals(type)) {
+                    String id = new JSONObject(r.body).optString("id", "");
+                    if (!id.isEmpty()) callIds.put(key, id);
+                }
+                if (!it.optString("replyKey", "").isEmpty()) ensurePolling();
+            } else if (r.code >= 500 || r.code == 429) {
+                return true;
+            } else {
+                Outbox.dropFirst(this);                                         // bad request / wrong password: do not loop forever
+                held.remove(it.optString("replyKey", ""));
+            }
+        }
+    }
+
+    // ---------- reply polling: runs only while at least one reply-able notification is held ----------
     private void ensurePolling() {
         if (!polling) { polling = true; handler.postDelayed(pollTask, POLL_MS); }
     }

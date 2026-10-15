@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
         boolean on = enabled != null && enabled.contains(getPackageName());
         if (on) { try { NotificationListenerService.class.getMethod("requestRebind", ComponentName.class).invoke(null, new ComponentName(this, NotifService.class)); } catch (Exception ignored) {} }  // revive listener after app updates
         statusText.setText((on ? "Forwarding: ON \u2713\nAll notifications and calls are sent to your dashboard."
-                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + Prefs.get(this, "connected", "never")
+                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nWaiting to send: " + Outbox.size(this) + "\nListener connected: " + Prefs.get(this, "connected", "never")
                 + "\nLast notification from any app: " + Prefs.get(this, "any", "none")
                 + "\n\nLast notification handled:\n" + Prefs.lastSeen(this));
     }
