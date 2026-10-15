@@ -3,7 +3,8 @@ import { json, preflight, passwordOk, db, misconfigured } from '../../../lib/htt
 
 export const dynamic = 'force-dynamic';
 const M = 'POST';
-const LIMITS = { appName: 100, title: 300, message: 4000, replyKey: 100 };
+const LIMITS = { appName: 100, title: 300, message: 4000, replyKey: 100, clientId: 200 };
+const MAX_AGE_MS = 7 * 24 * 3600 * 1000;
 const TYPES = new Set(['CALL', 'MESSAGE']);
 const DEDUPE_WINDOW_MS = 20_000;
 
@@ -31,10 +32,19 @@ export async function POST(req) {
   };
   if (row.type !== 'CALL' && looksLikeCall(`${row.title} ${row.message}`)) row.type = 'CALL';
 
+  // Original time of the notification on the phone (kept when it had to be re-sent after being offline)
+  const postedAt = Number(body.postedAt);
+  const now = Date.now();
+  if (Number.isFinite(postedAt) && postedAt > now - MAX_AGE_MS && postedAt < now + 5 * 60 * 1000) {
+    row.created_at = new Date(postedAt).toISOString();
+  }
+
   const replyKey = clean(body.replyKey, LIMITS.replyKey, '');
-  const bucket = Math.floor(Date.now() / DEDUPE_WINDOW_MS);
+  // Exact idempotency when the phone app sends a clientId; time-window fallback for other senders (e.g. MacroDroid)
+  const clientId = clean(body.clientId, LIMITS.clientId, '');
+  const bucket = Math.floor(now / DEDUPE_WINDOW_MS);
   const dedupe_key = crypto.createHash('sha256')
-    .update([row.app_name, row.title, row.message, row.type, bucket].join('|')).digest('hex');
+    .update(clientId ? 'c|' + clientId : [row.app_name, row.title, row.message, row.type, bucket].join('|')).digest('hex');
 
   const extra = { dedupe_key, ...(replyKey && row.type !== 'CALL' ? { reply_key: replyKey, can_reply: true } : {}) };
   let { data, error } = await db().from('notifications').insert({ ...row, ...extra }).select('id').single();
