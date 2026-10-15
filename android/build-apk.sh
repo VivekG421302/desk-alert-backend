@@ -13,6 +13,7 @@ mkdir -p "$W/gen" "$W/obj"
 # Gradle-style manifest -> add package/sdk attributes for aapt
 sed -e 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.deskalert.trigger" android:versionCode="6" android:versionName="2.3"><uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>#' \
   app/src/main/AndroidManifest.xml > "$W/AndroidManifest.xml"
+grep -q 'package="com.deskalert.trigger"' "$W/AndroidManifest.xml" || { echo "manifest rewrite failed"; exit 1; }
 
 aapt package -f -m -J "$W/gen" -M "$W/AndroidManifest.xml" -S app/src/main/res -I "$AJ" -F "$W/res.apk"
 javac --release 8 -cp "$AJ" -d "$W/obj" "$W"/gen/com/deskalert/trigger/R.java app/src/main/java/com/deskalert/trigger/*.java
