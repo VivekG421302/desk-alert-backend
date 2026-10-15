@@ -3,6 +3,7 @@ package com.deskalert.trigger;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.RemoteInput;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
@@ -69,7 +70,15 @@ public class NotifService extends NotificationListenerService {
     @Override public void onListenerConnected() {
         super.onListenerConnected();
         Prefs.put(this, "connected", Prefs.now());
+        Journal.add(this, "Desk Alert", "Notification listener", "CONNECTED");
         kickFlush();                                           // send anything left in the queue
+    }
+
+    // API 24+: called by Android when the listener is unbound (no @Override: the build SDK here is older)
+    public void onListenerDisconnected() {
+        Journal.add(this, "Desk Alert", "Notification listener", "DISCONNECTED - asking Android to reconnect");
+        try { NotificationListenerService.class.getMethod("requestRebind", ComponentName.class).invoke(null, new ComponentName(this, NotifService.class)); }
+        catch (Exception ignored) {}
     }
 
     private static String str(CharSequence cs) { return cs == null ? "" : cs.toString().trim(); }
@@ -113,6 +122,7 @@ public class NotifService extends NotificationListenerService {
             handle(sbn);
         } catch (Throwable t) {
             Prefs.setLastSeen(this, "ERROR: " + t.getClass().getSimpleName() + " " + t.getMessage());
+            Journal.add(this, sbn.getPackageName(), "", "ERROR: " + t.getClass().getSimpleName() + " " + t.getMessage());
         }
     }
 
@@ -120,7 +130,7 @@ public class NotifService extends NotificationListenerService {
         final String pkg = sbn.getPackageName();
         if (getPackageName().equals(pkg)) return;                                  // never forward our own notifications
         final String password = Prefs.password(this);
-        if (password.isEmpty()) return;
+        if (password.isEmpty()) { Journal.add(this, pkg, "", "NOT SENT: enter your app password in Desk Alert"); return; }
 
         Notification n = sbn.getNotification();
         Bundle e = n.extras;
@@ -158,6 +168,7 @@ public class NotifService extends NotificationListenerService {
             String sig = title + "|" + text;
             if (sig.equals(lastSig.get(key))) return;
             lastSig.put(key, sig);
+            Journal.add(this, appName, title + ": " + text, "QUEUED (incoming call)");
             final JSONObject it = item(appName, title.isEmpty() ? (wa ? "WhatsApp call" : "Incoming call") : title, text, "CALL",
                     System.currentTimeMillis(), pkg + "|" + key + "|call|" + sbn.getPostTime());
             it.put("_key", key);
@@ -178,7 +189,11 @@ public class NotifService extends NotificationListenerService {
         else if (callCategory && !missed) skip = "call in progress";
         else if (wa && (title.equalsIgnoreCase("WhatsApp") || title.equalsIgnoreCase("WhatsApp Business"))) skip = "generic WhatsApp";
         else if (wa && all.matches("^.*\\b\\d+ new messages?.*$")) skip = "count summary";
-        if (skip != null) { Prefs.setLastSeen(this, "SKIPPED (" + skip + ")\n" + info); return; }
+        if (skip != null) {
+            Prefs.setLastSeen(this, "SKIPPED (" + skip + ")\n" + info);
+            Journal.add(this, appName, title + ": " + fullText, "SKIPPED: " + skip);
+            return;
+        }
 
         List<JSONObject> items = new ArrayList<JSONObject>();
         Parcelable[] msgs = e.getParcelableArray("android.messages");
@@ -224,7 +239,10 @@ public class NotifService extends NotificationListenerService {
                 }
             }
         }
-        if (items.isEmpty()) return;
+        if (items.isEmpty()) {
+            if (!ongoing) Journal.add(this, appName, title + ": " + fullText, "IGNORED: already sent");
+            return;
+        }
         lastSent.put(key, System.currentTimeMillis());
         if (lastMsgTime.size() > 500) lastMsgTime.clear();
         if (lastSent.size() > 500) lastSent.clear();
@@ -242,7 +260,10 @@ public class NotifService extends NotificationListenerService {
             }
         }
         Prefs.setLastSeen(this, "SENT " + items.size() + " as MESSAGE\n" + info);
-        for (JSONObject it : items) Outbox.add(this, it);
+        for (JSONObject it : items) {
+            Outbox.add(this, it);
+            Journal.add(this, appName, it.optString("title") + ": " + it.optString("message"), "QUEUED");
+        }
         kickFlush();
     }
 
@@ -261,6 +282,7 @@ public class NotifService extends NotificationListenerService {
     /** Handler thread. */
     private void endCall(String key, String password) {
         callKeys.remove(key);
+        Journal.add(this, "Call", "Ringing ended", "CARD REMOVED");
         String id = callIds.remove(key);
         if (id == null) { cancelledCalls.add(key); return; }                   // not sent yet: flush will drop it
         if (password.isEmpty()) return;
@@ -288,21 +310,33 @@ public class NotifService extends NotificationListenerService {
             String key = it.optString("_key", "");
             if ("CALL".equals(type)) {
                 long age = System.currentTimeMillis() - it.optLong("postedAt", System.currentTimeMillis());
-                if (age > 90000L || cancelledCalls.remove(key)) { Outbox.dropFirst(this); callKeys.remove(key); continue; }   // stale ring
+                if (age > 90000L || cancelledCalls.remove(key)) {                                                    // stale ring
+                    Outbox.dropFirst(this); callKeys.remove(key);
+                    Journal.add(this, it.optString("appName"), it.optString("title"), "SKIPPED: call already ended");
+                    continue;
+                }
             }
             JSONObject body = new JSONObject(it.toString()).put("secret", password);
             Api.Result r;
-            try { r = Api.request("POST", "/api/noti", password, body.toString()); } catch (Exception ex) { return true; }
+            String sum = it.optString("title") + ": " + it.optString("message");
+            try { r = Api.request("POST", "/api/noti", password, body.toString()); }
+            catch (Exception ex) {
+                Journal.add(this, it.optString("appName"), sum, "OFFLINE: " + ex.getClass().getSimpleName() + " - retrying in " + (backoff / 1000) + "s");
+                return true;
+            }
             if (r.ok()) {
                 Outbox.dropFirst(this);
+                Journal.add(this, it.optString("appName"), sum, "SENT (HTTP " + r.code + (r.body.contains("\"duplicate\"") ? ", duplicate ignored" : "") + ")");
                 if ("CALL".equals(type)) {
                     String id = new JSONObject(r.body).optString("id", "");
                     if (!id.isEmpty()) callIds.put(key, id);
                 }
                 if (!it.optString("replyKey", "").isEmpty()) ensurePolling();
             } else if (r.code >= 500 || r.code == 429) {
+                Journal.add(this, it.optString("appName"), sum, "FAILED: server error HTTP " + r.code + " - retrying in " + (backoff / 1000) + "s");
                 return true;
             } else {
+                Journal.add(this, it.optString("appName"), sum, "REJECTED: HTTP " + r.code + (r.code == 401 ? " (wrong password)" : ""));
                 Outbox.dropFirst(this);                                         // bad request / wrong password: do not loop forever
                 held.remove(it.optString("replyKey", ""));
             }

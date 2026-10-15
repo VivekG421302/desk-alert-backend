@@ -7,6 +7,9 @@
     <TextView android:id="@+id/statusText" android:layout_width="match_parent" android:layout_height="wrap_content"
         android:textSize="15sp" android:paddingBottom="12dp" />
 
+    <Button android:id="@+id/logButton" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="View activity log" />
+
     <Button android:id="@+id/accessButton" android:layout_width="match_parent" android:layout_height="wrap_content"
         android:text="Open notification access settings" />
 

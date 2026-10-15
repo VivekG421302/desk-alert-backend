@@ -32,6 +32,9 @@ public class MainActivity extends Activity {
         statusText = (TextView) findViewById(R.id.statusText);
         passwordInput.setText(Prefs.password(this));
 
+        findViewById(R.id.logButton).setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { startActivity(new Intent(MainActivity.this, LogActivity.class)); }
+        });
         findViewById(R.id.accessButton).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); }
         });
