@@ -4,6 +4,7 @@ import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.RemoteInput;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -16,8 +17,14 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Forwards WhatsApp messages/calls to the backend and sends dashboard replies via the notification's inline reply. */
+/**
+ * Forwards every useful notification (any app) to the backend.
+ * Incoming calls (WhatsApp and normal phone calls) are sent as CALL and removed again when the ringing ends.
+ * Dashboard replies are sent through a notification's inline-reply action.
+ */
 public class NotifService extends NotificationListenerService {
+    private static final String WA = "com.whatsapp";
+    private static final String WA_BIZ = "com.whatsapp.w4b";
     private static final long HOLD_MS = 30 * 60 * 1000L;
     private static final long POLL_MS = 4000L;
 
@@ -26,8 +33,9 @@ public class NotifService extends NotificationListenerService {
         Held(Notification.Action a, String k) { action = a; sbnKey = k; time = System.currentTimeMillis(); }
     }
 
-    private final Map<String, Held> held = new ConcurrentHashMap<String, Held>();      // reply token -> inline reply action
-    private final Map<String, String> lastSig = new ConcurrentHashMap<String, String>(); // sbn key -> last title|text
+    private final Map<String, Held> held = new ConcurrentHashMap<String, Held>();        // reply token -> inline reply action
+    private final Map<String, String> lastSig = new ConcurrentHashMap<String, String>();   // sbn key -> last title|text
+    private final Map<String, String> callIds = new ConcurrentHashMap<String, String>();   // sbn key -> dashboard id of a ringing call
     private HandlerThread thread;
     private Handler handler;
     private boolean polling;
@@ -41,6 +49,8 @@ public class NotifService extends NotificationListenerService {
 
     @Override public void onDestroy() { super.onDestroy(); thread.quit(); }
 
+    @Override public void onListenerConnected() { super.onListenerConnected(); Prefs.put(this, "connected", Prefs.now()); }
+
     private static String str(CharSequence cs) { return cs == null ? "" : cs.toString().trim(); }
 
     private static String firstNonEmpty(Bundle e, String... keys) {
@@ -48,7 +58,17 @@ public class NotifService extends NotificationListenerService {
         return "";
     }
 
-    @Override public void onListenerConnected() { super.onListenerConnected(); Prefs.put(this, "connected", Prefs.now()); }
+    private String labelFor(String pkg) {
+        if (WA.equals(pkg)) return "WhatsApp";
+        if (WA_BIZ.equals(pkg)) return "WhatsApp Business";
+        try {
+            PackageManager pm = getPackageManager();
+            return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (Exception ex) {
+            String last = pkg.substring(pkg.lastIndexOf('.') + 1);
+            return last.isEmpty() ? pkg : Character.toUpperCase(last.charAt(0)) + last.substring(1);
+        }
+    }
 
     @Override public void onNotificationPosted(StatusBarNotification sbn) {
         try {
@@ -60,8 +80,8 @@ public class NotifService extends NotificationListenerService {
     }
 
     private void handle(StatusBarNotification sbn) {
-        String pkg = sbn.getPackageName();
-        if (!"com.whatsapp".equals(pkg) && !"com.whatsapp.w4b".equals(pkg)) return;
+        final String pkg = sbn.getPackageName();
+        if (getPackageName().equals(pkg)) return;                                  // never forward our own notifications
         final String password = Prefs.password(this);
         if (password.isEmpty()) return;
 
@@ -72,26 +92,42 @@ public class NotifService extends NotificationListenerService {
         String all = (title + " " + text).toLowerCase();
         int actionCount = n.actions == null ? 0 : n.actions.length;
         boolean fullScreen = n.fullScreenIntent != null;
+        boolean wa = WA.equals(pkg) || WA_BIZ.equals(pkg);
         boolean missedOrOngoing = all.contains("missed") || all.contains("ongoing") || all.contains("ended") || all.contains("declined");
-        // Incoming call = ringing: full-screen intent, or "incoming ... call" text, or call category with Answer/Decline actions
-        final boolean call = !missedOrOngoing
-                && (fullScreen || (all.contains("incoming") && all.contains("call"))
-                    || (Notification.CATEGORY_CALL.equals(n.category) && actionCount >= 2));
-        String info = "title=" + title + " | text=" + text + " | cat=" + n.category + " | flags=" + n.flags
+        boolean incomingText = all.contains("incoming") && all.contains("call");
+        boolean callCategory = Notification.CATEGORY_CALL.equals(n.category);
+        boolean dialerLike = pkg.contains("incallui") || pkg.contains("dialer") || pkg.contains("telecom") || pkg.equals("com.android.phone");
+
+        final boolean call;
+        if (wa) {
+            // unchanged rule that already works for WhatsApp
+            call = !missedOrOngoing && (fullScreen || incomingText || (callCategory && actionCount >= 2));
+        } else {
+            // normal phone calls and other calling apps: must look like a call AND be ringing
+            call = !missedOrOngoing && (callCategory || dialerLike) && (fullScreen || incomingText);
+        }
+        final String key = sbn.getKey();
+        String info = "pkg=" + pkg + " | title=" + title + " | text=" + text + " | cat=" + n.category + " | flags=" + n.flags
                 + " | fullScreen=" + fullScreen + " | actions=" + actionCount;
+
+        // A ringing call that has turned into something else (answered / ongoing) -> remove its dashboard card
+        if (!call && callIds.containsKey(key)) removeCallCard(key, password);
 
         if (!call) {
             String skip = null;
-            if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) skip = "group summary";            // duplicates every message
-            else if ((n.flags & Notification.FLAG_ONGOING_EVENT) != 0) skip = "ongoing";            // "WhatsApp Web is active", etc.
-            else if (text.isEmpty() || title.equalsIgnoreCase("WhatsApp") || title.equalsIgnoreCase("WhatsApp Business")) skip = "generic/empty";
-            else if (text.toLowerCase().matches("^\\d+ new messages?.*")) skip = "count summary";
+            int f = n.flags;
+            if ((f & Notification.FLAG_GROUP_SUMMARY) != 0) skip = "group summary";                         // duplicates its children
+            else if ((f & (Notification.FLAG_ONGOING_EVENT | Notification.FLAG_FOREGROUND_SERVICE)) != 0) skip = "ongoing";
+            else if (Notification.CATEGORY_PROGRESS.equals(n.category) || Notification.CATEGORY_TRANSPORT.equals(n.category)
+                    || Notification.CATEGORY_SERVICE.equals(n.category)) skip = "progress/media/service";
+            else if (title.isEmpty() && text.isEmpty()) skip = "empty";
+            else if (wa && (text.isEmpty() || title.equalsIgnoreCase("WhatsApp") || title.equalsIgnoreCase("WhatsApp Business"))) skip = "generic WhatsApp";
+            else if (wa && text.toLowerCase().matches("^\\d+ new messages?.*")) skip = "count summary";
             if (skip != null) { Prefs.setLastSeen(this, "SKIPPED (" + skip + ")\n" + info); return; }
         }
 
-        final String key = sbn.getKey();
         String sig = title + "|" + text;
-        if (sig.equals(lastSig.get(key))) return;                                          // re-post of the same notification
+        if (sig.equals(lastSig.get(key))) return;                                                          // re-post of the same notification
         lastSig.put(key, sig);
         Prefs.setLastSeen(this, (call ? "SENT as CALL" : "SENT as MESSAGE") + "\n" + info);
 
@@ -104,18 +140,22 @@ public class NotifService extends NotificationListenerService {
         }
         final String replyKey = token;
         final boolean isCall = call;
-        final String appName = "com.whatsapp.w4b".equals(pkg) ? "WhatsApp Business" : "WhatsApp";
+        final String appName = labelFor(pkg);
 
         handler.post(new Runnable() { public void run() {
             try {
                 JSONObject body = new JSONObject().put("secret", password).put("appName", appName)
-                        .put("title", title.isEmpty() ? (isCall ? "WhatsApp call" : "Unknown") : title)
+                        .put("title", title.isEmpty() ? (isCall ? "Incoming call" : appName) : title)
                         .put("message", text.isEmpty() ? (isCall ? "Incoming call" : "(no content)") : text)
                         .put("type", isCall ? "CALL" : "MESSAGE");
                 if (!replyKey.isEmpty()) body.put("replyKey", replyKey);
                 Api.Result r = Api.request("POST", "/api/noti", password, body.toString());
-                if (!r.ok()) held.remove(replyKey);
-                else if (!replyKey.isEmpty()) ensurePolling();
+                if (!r.ok()) { held.remove(replyKey); return; }
+                if (!replyKey.isEmpty()) ensurePolling();
+                if (isCall) {
+                    String id = new JSONObject(r.body).optString("id", "");
+                    if (!id.isEmpty()) callIds.put(key, id);
+                }
             } catch (Exception ex) { held.remove(replyKey); }
         }});
     }
@@ -126,6 +166,17 @@ public class NotifService extends NotificationListenerService {
         for (Iterator<Map.Entry<String, Held>> it = held.entrySet().iterator(); it.hasNext();) {
             if (it.next().getValue().sbnKey.equals(key)) it.remove();
         }
+        // Ringing ended (missed / declined / answered): take the call card off the dashboard
+        if (callIds.containsKey(key)) removeCallCard(key, Prefs.password(this));
+    }
+
+    /** Runs on the network thread, after any pending POST for the same call, so the id is known by then. */
+    private void removeCallCard(final String key, final String password) {
+        handler.post(new Runnable() { public void run() {
+            String id = callIds.remove(key);
+            if (id == null || password.isEmpty()) return;
+            try { Api.request("DELETE", "/api/notification?id=" + id, password, null); } catch (Exception ignored) {}
+        }});
     }
 
     // ---- reply polling: runs only while at least one reply-able notification is held ----

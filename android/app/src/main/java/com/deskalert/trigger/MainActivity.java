@@ -48,10 +48,10 @@ public class MainActivity extends Activity {
         String enabled = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
         boolean on = enabled != null && enabled.contains(getPackageName());
         if (on) { try { NotificationListenerService.class.getMethod("requestRebind", ComponentName.class).invoke(null, new ComponentName(this, NotifService.class)); } catch (Exception ignored) {} }  // revive listener after app updates
-        statusText.setText((on ? "WhatsApp forwarding: ON \u2713\nMessages and calls are sent to your dashboard."
-                              : "WhatsApp forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + Prefs.get(this, "connected", "never")
+        statusText.setText((on ? "Forwarding: ON \u2713\nAll notifications and calls are sent to your dashboard."
+                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + Prefs.get(this, "connected", "never")
                 + "\nLast notification from any app: " + Prefs.get(this, "any", "none")
-                + "\n\nLast WhatsApp notification seen:\n" + Prefs.lastSeen(this));
+                + "\n\nLast notification handled:\n" + Prefs.lastSeen(this));
     }
 
     @Override protected void onPause() { super.onPause(); Prefs.setPassword(this, passwordInput.getText().toString().trim()); }
