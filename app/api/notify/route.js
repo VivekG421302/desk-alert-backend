@@ -41,7 +41,8 @@ export async function POST(req) {
 
   if (error?.code === '23505') {                       // same alert already stored in this window
     if (extra.reply_key) await db().from('notifications').update({ reply_key: replyKey, can_reply: true }).eq('dedupe_key', dedupe_key);
-    return json({ ok: true, duplicate: true }, 200, M);
+    const { data: existing } = await db().from('notifications').select('id').eq('dedupe_key', dedupe_key).maybeSingle();
+    return json({ ok: true, duplicate: true, id: existing?.id }, 200, M);
   }
   if (error && (error.code === '42703' || error.code === 'PGRST204')) {   // migration 003 not run yet
     ({ data, error } = await db().from('notifications').insert(row).select('id').single());
