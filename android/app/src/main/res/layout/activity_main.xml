@@ -7,6 +7,9 @@
     <TextView android:id="@+id/statusText" android:layout_width="match_parent" android:layout_height="wrap_content"
         android:textSize="15sp" android:paddingBottom="12dp" />
 
+    <Button android:id="@+id/restartButton" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Restart notification listener" />
+
     <Button android:id="@+id/logButton" android:layout_width="match_parent" android:layout_height="wrap_content"
         android:text="View activity log" />
 

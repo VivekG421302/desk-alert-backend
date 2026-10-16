@@ -99,6 +99,7 @@ public class NotifService extends NotificationListenerService {
     @Override public void onListenerConnected() {
         super.onListenerConnected();
         Prefs.put(this, "connected", Prefs.now());
+        Prefs.put(this, "connected_ts", String.valueOf(System.currentTimeMillis()));
         Journal.add(this, "Desk Alert", "Notification listener", "CONNECTED");
         kickFlush();                                           // send anything left in the queue
     }
@@ -149,6 +150,7 @@ public class NotifService extends NotificationListenerService {
     @Override public void onNotificationPosted(StatusBarNotification sbn) {
         try {
             Prefs.put(this, "any", sbn.getPackageName() + " at " + Prefs.now());
+            Prefs.put(this, "any_ts", String.valueOf(System.currentTimeMillis()));
             handle(sbn);
         } catch (Throwable t) {
             Prefs.setLastSeen(this, "ERROR: " + t.getClass().getSimpleName() + " " + t.getMessage());

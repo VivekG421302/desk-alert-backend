@@ -35,6 +35,14 @@ public class MainActivity extends Activity {
         findViewById(R.id.logButton).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { startActivity(new Intent(MainActivity.this, LogActivity.class)); }
         });
+        RebindJob.schedule(this);
+        findViewById(R.id.restartButton).setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                RebindJob.rebind(MainActivity.this);
+                Journal.add(MainActivity.this, "Desk Alert", "Restart listener button", "LISTENER RESTART requested");
+                toast("Asked Android to restart the listener. If nothing arrives, switch Notification access off and on.");
+            }
+        });
         findViewById(R.id.accessButton).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); }
         });
@@ -52,8 +60,9 @@ public class MainActivity extends Activity {
         boolean on = enabled != null && enabled.contains(getPackageName());
         if (on) { try { NotificationListenerService.class.getMethod("requestRebind", ComponentName.class).invoke(null, new ComponentName(this, NotifService.class)); } catch (Exception ignored) {} }  // revive listener after app updates
         statusText.setText((on ? "Forwarding: ON \u2713\nAll notifications and calls are sent to your dashboard."
-                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nWaiting to send: " + Outbox.size(this) + "\nListener connected: " + Prefs.get(this, "connected", "never")
-                + "\nLast notification from any app: " + Prefs.get(this, "any", "none")
+                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + ago(Prefs.get(this, "connected_ts", "0")) + "\nLast notification from any app: " + ago(Prefs.get(this, "any_ts", "0")) + "\nWatchdog last ran: " + ago(Prefs.get(this, "watchdog_ts", "0"))
+                + "\nLast app seen: " + Prefs.get(this, "any", "none")
+                + "\n\nWaiting to send: " + Outbox.size(this)
                 + "\n\nLast notification handled:\n" + Prefs.lastSeen(this));
     }
 
@@ -80,6 +89,13 @@ public class MainActivity extends Activity {
                 }});
             }
         });
+    }
+
+    private static String ago(String ts) {
+        long t; try { t = Long.parseLong(ts); } catch (Exception e) { t = 0; }
+        if (t == 0) return "never";
+        long m = (System.currentTimeMillis() - t) / 60000;
+        return m < 1 ? "just now" : m < 120 ? m + " min ago" : (m / 60) + " h ago";
     }
 
     private void toast(String t) { Toast.makeText(this, t, Toast.LENGTH_SHORT).show(); }
