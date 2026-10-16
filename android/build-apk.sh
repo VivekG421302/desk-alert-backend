@@ -11,7 +11,7 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/gen" "$W/obj"
 
 # Gradle-style manifest -> add package/sdk attributes for aapt
-sed -e 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.deskalert.trigger" android:versionCode="11" android:versionName="2.8"><uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>#' \
+sed -e 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.deskalert.trigger" android:versionCode="12" android:versionName="2.9"><uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>#' \
   app/src/main/AndroidManifest.xml > "$W/AndroidManifest.xml"
 grep -q 'package="com.deskalert.trigger"' "$W/AndroidManifest.xml" || { echo "manifest rewrite failed"; exit 1; }
 

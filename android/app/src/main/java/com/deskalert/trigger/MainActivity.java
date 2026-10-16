@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
+import android.os.PowerManager;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.service.notification.NotificationListenerService;
@@ -36,10 +38,25 @@ public class MainActivity extends Activity {
             public void onClick(View v) { startActivity(new Intent(MainActivity.this, LogActivity.class)); }
         });
         RebindJob.schedule(this);
+        findViewById(R.id.batteryButton).setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                try { startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName()))); }
+                catch (Exception e) { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
+            }
+        });
+        findViewById(R.id.autostartButton).setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                try {   // Xiaomi / HyperOS autostart page
+                    Intent i = new Intent(); i.setComponent(new ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"));
+                    startActivity(i);
+                } catch (Exception e) {
+                    startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+                }
+            }
+        });
         findViewById(R.id.restartButton).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                RebindJob.rebind(MainActivity.this);
-                Journal.add(MainActivity.this, "Desk Alert", "Restart listener button", "LISTENER RESTART requested");
+                RebindJob.heal(MainActivity.this, true, "Restart button");
                 toast("Asked Android to restart the listener. If nothing arrives, switch Notification access off and on.");
             }
         });
@@ -58,9 +75,15 @@ public class MainActivity extends Activity {
         super.onResume();
         String enabled = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
         boolean on = enabled != null && enabled.contains(getPackageName());
-        if (on) { try { NotificationListenerService.class.getMethod("requestRebind", ComponentName.class).invoke(null, new ComponentName(this, NotifService.class)); } catch (Exception ignored) {} }  // revive listener after app updates
+        if (on) {                                   // opening the app always restarts the listener if it has been quiet for 10+ min
+            long last = 0; try { last = Long.parseLong(Prefs.get(this, "any_ts", "0")); } catch (Exception ignored) {}
+            boolean quiet = last == 0 || System.currentTimeMillis() - last > 10 * 60000L;
+            if (quiet) RebindJob.heal(this, true, "App opened"); else RebindJob.rebind(this);
+        }
+        boolean batteryOk = false;
+        try { batteryOk = ((PowerManager) getSystemService(POWER_SERVICE)).isIgnoringBatteryOptimizations(getPackageName()); } catch (Exception ignored) {}
         statusText.setText((on ? "Forwarding: ON \u2713\nAll notifications and calls are sent to your dashboard."
-                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + ago(Prefs.get(this, "connected_ts", "0")) + "\nLast notification from any app: " + ago(Prefs.get(this, "any_ts", "0")) + "\nWatchdog last ran: " + ago(Prefs.get(this, "watchdog_ts", "0"))
+                              : "Forwarding: OFF\nTap below and enable Desk Alert under notification access.") + "\n\nListener connected: " + ago(Prefs.get(this, "connected_ts", "0")) + "\nLast notification from any app: " + ago(Prefs.get(this, "any_ts", "0")) + "\nWatchdog last ran: " + ago(Prefs.get(this, "watchdog_ts", "0")) + "\nBattery: " + (batteryOk ? "unrestricted \u2713" : "RESTRICTED - tap button 1 below")
                 + "\nLast app seen: " + Prefs.get(this, "any", "none")
                 + "\n\nWaiting to send: " + Outbox.size(this)
                 + "\n\nLast notification handled:\n" + Prefs.lastSeen(this));

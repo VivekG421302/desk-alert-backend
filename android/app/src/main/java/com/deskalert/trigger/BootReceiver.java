@@ -8,7 +8,6 @@ import android.content.Intent;
 public class BootReceiver extends BroadcastReceiver {
     @Override public void onReceive(Context c, Intent i) {
         RebindJob.schedule(c);
-        RebindJob.rebind(c);
-        Journal.add(c, "Desk Alert", "Phone restarted / app updated", "WATCHDOG: reconnecting listener");
+        RebindJob.heal(c, true, "Phone restarted / app updated");
     }
 }
