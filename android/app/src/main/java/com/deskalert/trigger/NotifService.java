@@ -61,7 +61,6 @@ public class NotifService extends NotificationListenerService {
     private HandlerThread thread, pollThread;
     private Handler handler;          // sender thread: outbox flush, call removal, keep-warm (never blocked by reply polling)
     private Handler pollHandler;      // reply polling thread
-    private boolean polling;          // pollHandler thread only
     private long backoff = 1000;      // quick retries: 1s, 2s, 4s, then every 5s
     private ConnectivityManager.NetworkCallback netCb;
 
@@ -74,6 +73,7 @@ public class NotifService extends NotificationListenerService {
         pollThread.start();
         pollHandler = new Handler(pollThread.getLooper());
         handler.postDelayed(warmTask, 2000);
+        pollHandler.postDelayed(pollTask, 5000);          // reply check runs for as long as the service lives
         try {   // the moment the network is back, flush immediately
             ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
             netCb = new ConnectivityManager.NetworkCallback() {
@@ -325,8 +325,20 @@ public class NotifService extends NotificationListenerService {
         final String key = sbn.getKey();
         lastSig.remove(key);
         seenLines.remove(key);                                  // lastMsgTime is kept on purpose: never resend old chat messages
+        final java.util.List<String> gone = new java.util.ArrayList<String>();
         for (Iterator<Map.Entry<String, Held>> it = held.entrySet().iterator(); it.hasNext();) {
-            if (it.next().getValue().sbnKey.equals(key)) it.remove();
+            Map.Entry<String, Held> en = it.next();
+            if (en.getValue().sbnKey.equals(key)) { gone.add(en.getKey()); it.remove(); }
+        }
+        if (!gone.isEmpty()) {
+            final String pw0 = Prefs.password(this);
+            handler.postDelayed(new Runnable() { public void run() {      // wait: apps re-post a notification right after removing it
+                if (pw0.isEmpty() || isStillActive(key)) return;
+                for (String t : gone) {
+                    if (held.containsKey(t)) continue;                    // re-posted meanwhile
+                    try { Api.request("POST", "/api/replies", pw0, new JSONObject().put("closeReplyKey", t).toString()); } catch (Exception ignored) {}
+                }
+            }}, 3000);
         }
         // ringing ended (missed / declined / answered): take the call card off the dashboard
         final String password = Prefs.password(this);
@@ -400,16 +412,26 @@ public class NotifService extends NotificationListenerService {
         }
     }
 
-    // ---------- reply polling: runs only while at least one reply-able notification is held ----------
-    private void ensurePolling() {
-        pollHandler.post(new Runnable() { public void run() {
-            if (!polling) { polling = true; pollHandler.postDelayed(pollTask, POLL_MS); }
-        }});
+    private boolean isStillActive(String key) {
+        try {
+            StatusBarNotification[] a = getActiveNotifications();
+            if (a != null) for (StatusBarNotification s : a) if (key.equals(s.getKey())) return true;
+        } catch (Throwable ignored) { return true; }
+        return false;
+    }
+
+    // ---------- reply polling: every 4 s while a chat can be replied to, every 12 s otherwise (so failures come back quickly) ----------
+    private int lastPollCode = 200;
+
+    private void ensurePolling() {                      // a reply-able chat just appeared: check again very soon
+        pollHandler.post(new Runnable() { public void run() { pollHandler.removeCallbacks(pollTask); pollHandler.postDelayed(pollTask, 1500); } });
     }
 
     private final Runnable pollTask = new Runnable() { public void run() {
-        try { pollReplies(); } catch (Exception ignored) {}
-        if (!held.isEmpty()) pollHandler.postDelayed(this, POLL_MS); else polling = false;
+        try { pollReplies(); } catch (Throwable t) {
+            if (lastPollCode != -1) { lastPollCode = -1; Journal.add(NotifService.this, "Reply", "check", "REPLY CHECK ERROR: " + t.getClass().getSimpleName()); }
+        }
+        pollHandler.postDelayed(this, held.isEmpty() ? 12000L : POLL_MS);
     }};
 
     private void pollReplies() throws Exception {
@@ -420,7 +442,11 @@ public class NotifService extends NotificationListenerService {
         String password = Prefs.password(this);
         if (password.isEmpty()) return;
         Api.Result r = Api.request("GET", "/api/replies", password, null);
-        if (!r.ok()) return;
+        if (!r.ok()) {
+            if (lastPollCode != r.code) { lastPollCode = r.code; Journal.add(this, "Reply", "check", "REPLY CHECK FAILED: HTTP " + r.code); }
+            return;
+        }
+        lastPollCode = 200;
         JSONArray items = new JSONObject(r.body).getJSONArray("items");
         for (int i = 0; i < items.length(); i++) {
             JSONObject it = items.getJSONObject(i);
