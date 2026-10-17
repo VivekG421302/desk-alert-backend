@@ -21,6 +21,10 @@ export async function GET(req) {
 export async function POST(req) {
   if (!passwordOk(req.headers.get('x-app-password'))) return json({ error: 'Unauthorized' }, 401, M);
   let body; try { body = await req.json(); } catch { return json({ error: 'Invalid JSON' }, 400, M); }
+  if (typeof body?.closeReplyKey === 'string' && body.closeReplyKey) {      // chat notification disappeared on the phone
+    await db().from('notifications').update({ can_reply: false }).eq('reply_key', body.closeReplyKey.slice(0, 100));
+    return json({ ok: true }, 200, M);
+  }
   if (typeof body?.id !== 'string') return json({ error: 'id required' }, 400, M);
   const { error } = await db().from('replies')
     .update({ status: body.ok ? 'sent' : 'failed', error: body.ok ? null : String(body.error || 'Failed').slice(0, 200) })
