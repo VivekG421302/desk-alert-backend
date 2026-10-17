@@ -8,6 +8,9 @@ export const OPTIONS = () => preflight(M);
 export async function GET(req) {
   if (misconfigured()) return json({ error: 'Server not configured' }, 500, M);
   if (!passwordOk(req.headers.get('x-app-password'))) return json({ error: 'Unauthorized' }, 401, M);
+  // A reply the phone did not pick up within 45 s is stale: expire it so it can never be sent late by surprise
+  const cutoff = new Date(Date.now() - 45_000).toISOString();
+  await db().from('replies').update({ status: 'failed', error: 'Expired: phone did not respond in time' }).eq('status', 'pending').lt('created_at', cutoff);
   const { data, error } = await db().from('replies')
     .select('id, reply_key, text').eq('status', 'pending').order('created_at').limit(20);
   if (error) return json({ error: 'Failed to load replies' }, 502, M);

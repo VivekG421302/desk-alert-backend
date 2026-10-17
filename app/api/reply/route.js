@@ -1,7 +1,7 @@
 import { json, preflight, passwordOk, db, misconfigured } from '../../../lib/http';
 
 export const dynamic = 'force-dynamic';
-const M = 'GET, POST';
+const M = 'GET, POST, DELETE';
 export const OPTIONS = () => preflight(M);
 
 // Dashboard queues a reply
@@ -29,4 +29,13 @@ export async function GET(req) {
   if (!id) return json({ error: 'id required' }, 400, M);
   const { data } = await db().from('replies').select('status, error').eq('id', id).maybeSingle();
   return data ? json(data, 200, M) : json({ error: 'Not found' }, 404, M);
+}
+
+// Dashboard gave up waiting: cancel the reply if the phone has not taken it yet
+export async function DELETE(req) {
+  if (!passwordOk(req.headers.get('x-app-password'))) return json({ error: 'Unauthorized' }, 401, M);
+  const id = new URL(req.url).searchParams.get('id');
+  if (!id) return json({ error: 'id required' }, 400, M);
+  await db().from('replies').update({ status: 'failed', error: 'Cancelled' }).eq('id', id).eq('status', 'pending');
+  return json({ ok: true }, 200, M);
 }
