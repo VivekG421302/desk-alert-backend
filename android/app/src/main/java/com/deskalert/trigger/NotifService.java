@@ -39,7 +39,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class NotifService extends NotificationListenerService {
     private static final String WA = "com.whatsapp";
     private static final String WA_BIZ = "com.whatsapp.w4b";
-    private static final long HOLD_MS = 30 * 60 * 1000L;
+    private static final long HOLD_MS = 24 * 60 * 60 * 1000L;
     private static final long POLL_MS = 4000L;
     private static final long ONGOING_THROTTLE_MS = 30000L;
     private static final int MAX_MESSAGES_PER_POST = 10;
@@ -101,7 +101,29 @@ public class NotifService extends NotificationListenerService {
         Prefs.put(this, "connected", Prefs.now());
         Prefs.put(this, "connected_ts", String.valueOf(System.currentTimeMillis()));
         Journal.add(this, "Desk Alert", "Notification listener", "CONNECTED");
+        rebuildReplyTargets();                                 // chats already in the notification shade stay reply-able after a restart
         kickFlush();                                           // send anything left in the queue
+    }
+
+    /** Same conversation always gets the same token, so dashboard replies keep working after the listener restarts. */
+    private static String replyToken(String pkg, String sbnKey) { return sha("reply|" + pkg + "|" + sbnKey); }
+
+    private void rebuildReplyTargets() {
+        try {
+            StatusBarNotification[] active = getActiveNotifications();
+            if (active == null) return;
+            for (StatusBarNotification sbn : active) {
+                String pkg = sbn.getPackageName();
+                Notification n = sbn.getNotification();
+                if (getPackageName().equals(pkg) || n.actions == null || (n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) continue;
+                for (Notification.Action a : n.actions) {
+                    RemoteInput[] ris = a.getRemoteInputs();
+                    if (ris != null && ris.length > 0) { held.put(replyToken(pkg, sbn.getKey()), new Held(a, sbn.getKey())); break; }
+                }
+            }
+            if (!held.isEmpty()) ensurePolling();
+            Journal.add(this, "Desk Alert", "Reply targets", held.size() + " chat(s) ready for replies");
+        } catch (Throwable ignored) {}
     }
 
     // API 24+: called by Android when the listener is unbound (no @Override: the build SDK here is older)
@@ -284,7 +306,7 @@ public class NotifService extends NotificationListenerService {
             for (Notification.Action a : n.actions) {
                 RemoteInput[] ris = a.getRemoteInputs();
                 if (ris != null && ris.length > 0) {
-                    String token = UUID.randomUUID().toString();
+                    String token = replyToken(pkg, key);
                     held.put(token, new Held(a, key));
                     items.get(items.size() - 1).put("replyKey", token);
                     break;
@@ -408,6 +430,7 @@ public class NotifService extends NotificationListenerService {
                 try { sendReply(h.action, it.getString("text")); ok = true; err = null; }
                 catch (Exception ex) { err = "Could not send: " + ex.getClass().getSimpleName(); }
             }
+            Journal.add(this, "Reply", it.optString("text"), ok ? "REPLY SENT" : "REPLY FAILED: " + err);
             JSONObject ack = new JSONObject().put("id", it.getString("id")).put("ok", ok);
             if (err != null) ack.put("error", err);
             Api.request("POST", "/api/replies", password, ack.toString());
